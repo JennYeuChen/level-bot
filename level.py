@@ -5,6 +5,8 @@ import os
 import datetime
 import threading
 from flask import Flask
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 
 app = Flask('')
 @app.route('/')
@@ -19,6 +21,29 @@ def run_flask():
 # 在啟動機器人前先啟動 Flask 執行緒
 web_thread = threading.Thread(target=run_flask, daemon=True)
 web_thread.start()
+
+# Google Sheets 設定
+SHEET_CONNECTED = False
+sheet = None
+try:
+    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/spreadsheets", 
+             "https://www.googleapis.com/auth/drive.file", "https://www.googleapis.com/auth/drive"]
+    # 將服務帳戶的 JSON 金鑰內容存入環境變數中，不要直接寫在程式碼裡
+    creds_json = os.environ.get("GOOGLE_CREDS")
+    if creds_json:
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(json.loads(creds_json), scope)
+        client = gspread.authorize(creds)
+        sheet = client.open("你的試算表名稱").sheet1 # 記得改名稱
+        SHEET_CONNECTED = True
+        print("📊 【系統】雲端 Google Sheets 連線成功！")
+    elif os.path.exists("creds.json"):
+        creds = ServiceAccountCredentials.from_json_keyfile_name("creds.json", scope)
+        client = gspread.authorize(creds)
+        sheet = client.open("你的試算表名稱").sheet1
+        SHEET_CONNECTED = True
+        print("📊 【系統】本地 Google Sheets 連線成功！")
+except Exception as e:
+    print(f"❌ 【系統】試算表連線失敗：{e}，自動降級純本地模式。")
 
 # 設定機器人
 intents = discord.Intents.default()
@@ -52,11 +77,38 @@ else:
     user_data = {}
 
 def save_data():
-    try:
-        with open(DATA_FILE, "w", encoding="utf-8") as f:
-            json.dump(user_data, f, indent=4, ensure_ascii=False)
-    except Exception as e:
-        print(f"【嚴重錯誤】無法寫入檔案！錯誤訊息：{e}")
+    try:
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(user_data, f, indent=4, ensure_ascii=False)
+    except Exception as e:
+        print(f"【嚴重錯誤】無法寫入檔案！錯誤訊息：{e}")
+
+def sync_to_sheets():
+    try:
+        if not SHEET_CONNECTED:
+            return
+        
+        # 將 dict 轉換成列表格式寫入
+        data_list = []
+        for u_id, stats in user_data.items():
+            data_list.append([u_id, stats["total_msg"], stats["daily_msg"], stats["level"], stats["current_xp"]])
+        
+        # 不要刪除，改為覆蓋
+        if data_list:
+            # 先寫入表頭
+            sheet.update(range_name='A1', values=[["user_id", "total_msg", "daily_msg", "level", "current_xp"]])
+            # 再寫入數據
+            sheet.update(range_name='A2', values=data_list)
+        print("📊 【系統】成功同步資料到 Google Sheets！")
+    except Exception as e:
+        print(f"❌ 【系統】同步失敗：{e}")
+
+# 定期同步任務（每 10 分鐘）
+@tasks.loop(minutes=10)
+async def sync_task():
+    save_data()  # 先保存到本地
+    sync_to_sheets()  # 再同步到雲端
+    print("【系統】已完成定期同步。")
 # -------------------------------------
 
 # 升級所需訊息量公式
@@ -113,8 +165,7 @@ async def on_message(message):
         )
         await message.channel.send(embed=embed)
 
-    save_data()
-    await bot.process_commands(message)
+    await bot.process_commands(message)
 
 # --- 3. 升級版 !rank 指令 ---
 @bot.command(name="rank")
@@ -191,9 +242,34 @@ async def leaderboard(ctx, scope="total"):
 # --- 5. 機器人上線通知 ---
 @bot.event
 async def on_ready():
-    print(f"新版等級與排名機器人已上線：{bot.user.name}")
-    if not reset_daily_stats.is_running():
-        reset_daily_stats.start()
+    print(f"新版等級與排名機器人已上線：{bot.user.name}")
+    
+    # 強制從 Sheets 讀取分數並覆蓋 user_data
+    if SHEET_CONNECTED:
+        try:
+            # 讀取 Sheet 上的數據（跳過表頭）
+            records = sheet.get_all_records()
+            if records:
+                # 清空舊數據
+                user_data.clear()
+                # 載入新數據
+                for record in records:
+                    u_id = str(record["user_id"])
+                    user_data[u_id] = {
+                        "total_msg": record["total_msg"],
+                        "daily_msg": record["daily_msg"],
+                        "level": record["level"],
+                        "current_xp": record["current_xp"]
+                    }
+                save_data()  # 也保存到本地
+                print(f"【系統】已成功從 Google Sheets 載入 {len(user_data)} 個使用者的資料！")
+        except Exception as e:
+            print(f"【系統】從 Sheets 載入失敗，使用本地資料：{e}")
+    
+    if not reset_daily_stats.is_running():
+        reset_daily_stats.start()
+    if not sync_task.is_running():
+        sync_task.start()
 
 # 執行機器人 (已放入你的 Token)
 if __name__ == "__main__":
